@@ -22,6 +22,7 @@ import os
 import shutil
 import sys
 from datetime import datetime
+from typing import Optional
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -46,6 +47,8 @@ from loop_utils.sim3utils import (
 from safetensors.torch import load_file
 
 from depth_anything_3.api import DepthAnything3
+from semantic_voxels.map import GraphMap
+from semantic_voxels.submap import SemanticSubmap
 
 matplotlib.use("Agg")
 
@@ -695,6 +698,7 @@ class DA3_Streaming:
                 self.save_depth_conf_result(predictions, chunk_idx + 1, s, R, t)
 
         self.save_camera_poses()
+        self.build_semantic_voxel_map()
 
         print("Done.")
 
@@ -815,6 +819,165 @@ class DA3_Streaming:
                 )
 
         print(f"Camera poses visualization saved to {ply_path}")
+
+    def _resolve_feature_path(
+        self, image_path: str, feature_dir: str, feature_suffix: str, feature_ext: str
+    ) -> str:
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        feature_ext = feature_ext if feature_ext.startswith(".") else f".{feature_ext}"
+        return os.path.join(feature_dir, f"{stem}{feature_suffix}{feature_ext}")
+
+    def _load_feature_map(self, feature_path: str, feature_key: Optional[str]) -> np.ndarray:
+        with np.load(feature_path) as data:
+            feat = None
+            if feature_key:
+                if feature_key not in data:
+                    raise KeyError(f"Feature key '{feature_key}' not found in {feature_path}")
+                feat = data[feature_key]
+            else:
+                # Try common keys, then fallback to the only array if unambiguous.
+                for key in ("feat", "feature", "features", "embedding", "embeddings"):
+                    if key in data:
+                        print(f"Using feature key: {key} in {feature_path}")
+                        feat = data[key]
+                        break
+                if feat is None:
+                    if len(data.files) == 1:
+                        feat = data[data.files[0]]
+                    else:
+                        raise KeyError(
+                            f"Could not infer feature array key in {feature_path}; keys={data.files}"
+                        )
+        if feat.ndim != 3:
+            raise ValueError(f"Feature map must be (H,W,d); got shape {feat.shape}")
+        return feat.astype(np.float32)
+
+    def build_semantic_voxel_map(self) -> None:
+        cfg = self.config.get("Semantic_Voxels", {})
+        if not cfg or not cfg.get("enable", False):
+            return
+
+        voxel_size = float(cfg.get("voxel_size", 0.1))
+        stride = int(cfg.get("stride", 1))
+        conf_threshold_coef = float(
+            cfg.get("conf_threshold_coef", self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"])
+        )
+        feature_dir = cfg.get("feature_dir") or self.img_dir
+        feature_key = cfg.get("feature_key", None)
+        feature_suffix = cfg.get("feature_suffix", "")
+        feature_ext = cfg.get("feature_ext", ".npz")
+        output_dir = os.path.join(self.output_dir, cfg.get("output_dir", "semantic_voxels"))
+        skip_missing_features = bool(cfg.get("skip_missing_features", True))
+        use_torch = bool(cfg.get("use_torch", True))
+        ignore_loop_closure_frames = bool(cfg.get("ignore_loop_closure_frames", False))
+        deduplicate_contributors = bool(cfg.get("deduplicate_contributors", True))
+
+        if not os.path.isdir(feature_dir):
+            raise FileNotFoundError(f"Feature directory not found: {feature_dir}")
+
+        graph = GraphMap()
+        for chunk_idx, chunk_range in enumerate(self.chunk_indices):
+            aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx}.npy")
+            if not os.path.exists(aligned_path):
+                print(f"[semantic] missing aligned chunk {aligned_path}, skipping")
+                continue
+
+            chunk_data = np.load(aligned_path, allow_pickle=True).item()
+            if isinstance(chunk_data, dict):
+                world_points = chunk_data.get("world_points", None)
+                conf = chunk_data.get("conf", None)
+            else:
+                depth = chunk_data.depth
+                intrinsics = chunk_data.intrinsics
+                extrinsics = chunk_data.extrinsics
+                if depth.ndim == 2:
+                    depth = depth[None, ...]
+                if intrinsics.ndim == 2:
+                    intrinsics = intrinsics[None, ...]
+                if extrinsics.ndim == 2:
+                    extrinsics = extrinsics[None, ...]
+                world_points = depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics)
+                conf = chunk_data.conf
+
+            if world_points is None or conf is None:
+                print(f"[semantic] chunk {chunk_idx} missing world_points/conf, skipping")
+                continue
+            world_points = np.asarray(world_points, dtype=np.float32)
+            conf = np.asarray(conf, dtype=np.float32)
+            if world_points.ndim == 3:
+                world_points = world_points[None, ...]
+            if conf.ndim == 2:
+                conf = conf[None, ...]
+
+            frame_ids = []
+            frame_id_to_name = {}
+            pts_list = []
+            conf_list = []
+            feat_list = []
+
+            frame_paths = self.img_list[chunk_range[0] : chunk_range[1]]
+            for local_idx, (frame_id, image_path) in enumerate(
+                zip(range(chunk_range[0], chunk_range[1]), frame_paths)
+            ):
+                feature_path = self._resolve_feature_path(
+                    image_path, feature_dir, feature_suffix, feature_ext
+                )
+                if not os.path.exists(feature_path):
+                    msg = f"[semantic] missing feature map {feature_path}"
+                    if skip_missing_features:
+                        print(msg + ", skipping frame")
+                        continue
+                    raise FileNotFoundError(msg)
+
+                feat = self._load_feature_map(feature_path, feature_key)
+                pts = np.asarray(world_points[local_idx], dtype=np.float32)
+                cfs = np.asarray(conf[local_idx], dtype=np.float32)
+
+                if feat.shape[0] != pts.shape[0] or feat.shape[1] != pts.shape[1]:
+                    raise ValueError(
+                        f"Feature map shape {feat.shape[:2]} doesn't match points "
+                        f"shape {pts.shape[:2]} for {image_path}"
+                    )
+
+                frame_ids.append(int(frame_id))
+                frame_id_to_name[str(frame_id)] = os.path.basename(image_path)
+                pts_list.append(pts)
+                conf_list.append(cfs)
+                feat_list.append(feat)
+
+            if len(pts_list) == 0:
+                continue
+
+            pointclouds = np.stack(pts_list, axis=0).astype(np.float32)
+            semantic_embeddings = np.stack(feat_list, axis=0).astype(np.float32)
+            conf_stack = np.stack(conf_list, axis=0).astype(np.float32)
+            conf_threshold = float(np.mean(conf_stack)) * conf_threshold_coef
+
+            submap = SemanticSubmap(
+                submap_id=chunk_idx,
+                pointclouds=pointclouds,
+                semantic_embeddings=semantic_embeddings,
+                conf=conf_stack,
+                conf_threshold=conf_threshold,
+                frame_ids=np.asarray(frame_ids, dtype=np.int64),
+                frame_id_to_name=frame_id_to_name,
+                H_world_map=np.eye(4, dtype=np.float64),
+            )
+            graph.add_submap(submap)
+
+        if graph.get_num_submaps() == 0:
+            print("[semantic] no submaps created, skipping voxelization")
+            return
+
+        voxel_map = graph.build_semantic_voxel_map(
+            voxel_size=voxel_size,
+            stride=stride,
+            ignore_loop_closure_frames=ignore_loop_closure_frames,
+            deduplicate_contributors=deduplicate_contributors,
+            use_torch=use_torch,
+        )
+        voxel_map.save_to_directory(output_dir)
+        print(f"[semantic] saved semantic voxel map to {output_dir}")
 
     def close(self):
         """

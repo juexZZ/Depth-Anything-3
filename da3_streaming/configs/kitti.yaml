@@ -49,3 +49,18 @@ Loop:
     # choose between 'cpp' or 'python'. will auto set 'python' if c++ version has not installed
     max_iterations: 30
     lambda_init: 1e-6
+
+Semantic_Voxels:
+  enable: False
+  voxel_size: 0.1
+  stride: 1
+  feature_dir: '' # default: image_dir
+  feature_key: '' # leave empty to auto-detect
+  feature_suffix: '' # e.g. '_feat' if filenames are <stem>_feat.npz
+  feature_ext: '.npz'
+  output_dir: 'semantic_voxels'
+  conf_threshold_coef: 0.75
+  skip_missing_features: True
+  use_torch: True
+  ignore_loop_closure_frames: False
+  deduplicate_contributors: True
