@@ -333,6 +333,337 @@ class GraphMap:
         )
         return SemanticVoxelMap(vox, frame_name_maps=frame_name_maps)
 
+    def build_semantic_voxel_map_from_submap_files(
+        self,
+        submap_files,
+        voxel_size: float,
+        stride: int = 1,
+        ignore_loop_closure_frames: bool = True,
+        deduplicate_contributors: bool = True,
+    ) -> SemanticVoxelMap:
+        """
+        Stream submaps from disk and aggregate into a global semantic voxel map.
+        Each submap file should contain:
+          - pointclouds: (S,H,W,3)
+          - semantic_embeddings: (S,H,W,d)
+          - conf: (S,H,W)
+          - conf_threshold: float
+          - frame_ids: (S,)
+          - frame_id_to_name: dict (saved with allow_pickle)
+          - H_world_map: (4,4)
+          - last_non_loop_frame_index: int (optional)
+          - submap_id: int
+        """
+        if voxel_size <= 0.0:
+            raise ValueError("voxel_size must be > 0")
+        if stride < 1:
+            raise ValueError("stride must be >= 1")
+
+        frame_name_maps = {}
+        voxel_sums = {}
+        voxel_counts = {}
+        voxel_contribs = {}
+
+        for path in submap_files:
+            with np.load(path, allow_pickle=True) as data:
+                pts = data["pointclouds"]
+                sem = data["semantic_embeddings"]
+                conf = data["conf"]
+                conf_threshold = float(data["conf_threshold"])
+                frame_ids = data["frame_ids"]
+                frame_id_to_name = data["frame_id_to_name"].item()
+                H_world_map = data["H_world_map"]
+                submap_id = int(data["submap_id"])
+                last_non_loop_frame_index = (
+                    int(data["last_non_loop_frame_index"])
+                    if "last_non_loop_frame_index" in data
+                    else None
+                )
+            if last_non_loop_frame_index is not None and last_non_loop_frame_index < 0:
+                last_non_loop_frame_index = None
+
+            frame_name_maps[str(submap_id)] = dict(frame_id_to_name)
+
+            end_idx = pts.shape[0]
+            if ignore_loop_closure_frames and (last_non_loop_frame_index is not None):
+                end_idx = min(end_idx, last_non_loop_frame_index + 1)
+
+            pts = pts[:end_idx]
+            sem = sem[:end_idx]
+            conf = conf[:end_idx]
+
+            if stride > 1:
+                pts = pts[:, ::stride, ::stride, :]
+                sem = sem[:, ::stride, ::stride, :]
+                conf = conf[:, ::stride, ::stride]
+
+            mask = conf >= conf_threshold
+            pts_flat = pts[mask]
+            sem_flat = sem[mask]
+            if pts_flat.shape[0] == 0:
+                continue
+
+            frame_idx_grid = np.broadcast_to(
+                np.arange(end_idx, dtype=np.int32)[:, None, None],
+                mask.shape,
+            )
+            frame_idx_flat = frame_idx_grid[mask].astype(np.int32)
+            frame_id_strs = np.array([str(frame_ids[int(i)]) for i in frame_idx_flat], dtype=object)
+
+            pts_h = np.concatenate(
+                [pts_flat, np.ones((pts_flat.shape[0], 1), dtype=pts_flat.dtype)], axis=1
+            )
+            pts_w_h = (H_world_map @ pts_h.T).T
+            pts_world = (pts_w_h[:, :3] / pts_w_h[:, 3:]).astype(np.float32)
+
+            # Per-submap filtering (same as in-memory path)
+            finite_mask = np.isfinite(pts_world).all(axis=1) & np.isfinite(sem_flat).all(axis=1)
+            if not np.all(finite_mask):
+                pts_world = pts_world[finite_mask]
+                sem_flat = sem_flat[finite_mask]
+                frame_id_strs = frame_id_strs[finite_mask]
+            if pts_world.shape[0] == 0:
+                continue
+
+            lo = np.percentile(pts_world, 0.5, axis=0)
+            hi = np.percentile(pts_world, 99.5, axis=0)
+            bbox_mask = (pts_world >= lo).all(axis=1) & (pts_world <= hi).all(axis=1)
+            if not np.all(bbox_mask):
+                pts_world = pts_world[bbox_mask]
+                sem_flat = sem_flat[bbox_mask]
+                frame_id_strs = frame_id_strs[bbox_mask]
+            if pts_world.shape[0] == 0:
+                continue
+            
+            # outlier filtering: points that fall into very sparse coarse cells are likely outliers.
+            coarse_cell = float(voxel_size) * 3.0
+            min_points_per_cell = 10
+            if coarse_cell > 0.0 and pts_world.shape[0] > 0:
+                coarse_coords = np.floor(pts_world / coarse_cell).astype(np.int64)
+                _, inv, counts = np.unique(
+                    coarse_coords, axis=0, return_inverse=True, return_counts=True
+                )
+                dense_mask = counts[inv] >= min_points_per_cell
+                if not np.all(dense_mask):
+                    pts_world = pts_world[dense_mask]
+                    sem_flat = sem_flat[dense_mask]
+                    frame_id_strs = frame_id_strs[dense_mask]
+            if pts_world.shape[0] == 0:
+                continue
+
+            voxel_coords = np.floor(pts_world / voxel_size).astype(np.int64)
+            unique_coords, inverse = np.unique(voxel_coords, axis=0, return_inverse=True)
+            num_vox = unique_coords.shape[0]
+            d = sem_flat.shape[1]
+            feat_sum = np.zeros((num_vox, d), dtype=np.float32)
+            counts = np.zeros((num_vox,), dtype=np.int64)
+            np.add.at(feat_sum, inverse, sem_flat.astype(np.float32))
+            np.add.at(counts, inverse, 1)
+
+            local_contribs = [set() for _ in range(num_vox)]
+            for p_i, v_i in enumerate(inverse.tolist()):
+                local_contribs[v_i].add((int(submap_id), str(frame_id_strs[p_i])))
+
+            for v_i, coord in enumerate(unique_coords):
+                key = (int(coord[0]), int(coord[1]), int(coord[2]))
+                if key not in voxel_sums:
+                    voxel_sums[key] = feat_sum[v_i].copy()
+                    voxel_counts[key] = int(counts[v_i])
+                    voxel_contribs[key] = set()
+                else:
+                    voxel_sums[key] += feat_sum[v_i]
+                    voxel_counts[key] += int(counts[v_i])
+                voxel_contribs[key].update(local_contribs[v_i])
+
+        if len(voxel_sums) == 0:
+            vox = SemanticVoxel(
+                voxel_size=float(voxel_size),
+                centers_world=np.zeros((0, 3), dtype=np.float32),
+                features=np.zeros((0, 0), dtype=np.float32),
+                contributors=[],
+            )
+            return SemanticVoxelMap(vox, frame_name_maps=frame_name_maps)
+
+        coords_list = np.array(list(voxel_sums.keys()), dtype=np.int64)
+        centers_world = ((coords_list.astype(np.float32) + 0.5) * voxel_size).astype(
+            np.float32
+        )
+        features = np.stack(
+            [voxel_sums[k] / max(voxel_counts[k], 1) for k in voxel_sums.keys()], axis=0
+        ).astype(np.float32)
+        contributors = []
+        for k in voxel_sums.keys():
+            contrib_list = sorted(list(voxel_contribs[k])) if deduplicate_contributors else list(
+                voxel_contribs[k]
+            )
+            contributors.append(contrib_list)
+
+        vox = SemanticVoxel(
+            voxel_size=float(voxel_size),
+            centers_world=centers_world,
+            features=features,
+            contributors=contributors,
+        )
+        return SemanticVoxelMap(vox, frame_name_maps=frame_name_maps)
+
+    def build_semantic_voxel_map_from_submap_stream(
+        self,
+        submap_iter,
+        voxel_size: float,
+        stride: int = 1,
+        ignore_loop_closure_frames: bool = True,
+        deduplicate_contributors: bool = True,
+    ) -> SemanticVoxelMap:
+        """
+        Stream submaps (dict payloads) and aggregate into a global semantic voxel map.
+        Each payload should contain the same keys as the submap files.
+        """
+        if voxel_size <= 0.0:
+            raise ValueError("voxel_size must be > 0")
+        if stride < 1:
+            raise ValueError("stride must be >= 1")
+
+        frame_name_maps = {}
+        voxel_sums = {}
+        voxel_counts = {}
+        voxel_contribs = {}
+
+        for payload in submap_iter:
+            pts = payload["pointclouds"]
+            sem = payload["semantic_embeddings"]
+            conf = payload["conf"]
+            conf_threshold = float(payload["conf_threshold"])
+            frame_ids = payload["frame_ids"]
+            frame_id_to_name = payload["frame_id_to_name"]
+            H_world_map = payload["H_world_map"]
+            submap_id = int(payload["submap_id"])
+            last_non_loop_frame_index = payload.get("last_non_loop_frame_index", None)
+            if last_non_loop_frame_index is not None and last_non_loop_frame_index < 0:
+                last_non_loop_frame_index = None
+
+            frame_name_maps[str(submap_id)] = dict(frame_id_to_name)
+
+            end_idx = pts.shape[0]
+            if ignore_loop_closure_frames and (last_non_loop_frame_index is not None):
+                end_idx = min(end_idx, last_non_loop_frame_index + 1)
+
+            pts = pts[:end_idx]
+            sem = sem[:end_idx]
+            conf = conf[:end_idx]
+
+            if stride > 1:
+                pts = pts[:, ::stride, ::stride, :]
+                sem = sem[:, ::stride, ::stride, :]
+                conf = conf[:, ::stride, ::stride]
+
+            mask = conf >= conf_threshold
+            pts_flat = pts[mask]
+            sem_flat = sem[mask]
+            if pts_flat.shape[0] == 0:
+                continue
+
+            frame_idx_grid = np.broadcast_to(
+                np.arange(end_idx, dtype=np.int32)[:, None, None],
+                mask.shape,
+            )
+            frame_idx_flat = frame_idx_grid[mask].astype(np.int32)
+            frame_id_strs = np.array([str(frame_ids[int(i)]) for i in frame_idx_flat], dtype=object)
+
+            pts_h = np.concatenate(
+                [pts_flat, np.ones((pts_flat.shape[0], 1), dtype=pts_flat.dtype)], axis=1
+            )
+            pts_w_h = (H_world_map @ pts_h.T).T
+            pts_world = (pts_w_h[:, :3] / pts_w_h[:, 3:]).astype(np.float32)
+
+            # Per-submap filtering (same as in-memory path)
+            finite_mask = np.isfinite(pts_world).all(axis=1) & np.isfinite(sem_flat).all(axis=1)
+            if not np.all(finite_mask):
+                pts_world = pts_world[finite_mask]
+                sem_flat = sem_flat[finite_mask]
+                frame_id_strs = frame_id_strs[finite_mask]
+            if pts_world.shape[0] == 0:
+                continue
+
+            lo = np.percentile(pts_world, 0.5, axis=0)
+            hi = np.percentile(pts_world, 99.5, axis=0)
+            bbox_mask = (pts_world >= lo).all(axis=1) & (pts_world <= hi).all(axis=1)
+            if not np.all(bbox_mask):
+                pts_world = pts_world[bbox_mask]
+                sem_flat = sem_flat[bbox_mask]
+                frame_id_strs = frame_id_strs[bbox_mask]
+            if pts_world.shape[0] == 0:
+                continue
+
+            coarse_cell = float(voxel_size) * 3.0
+            min_points_per_cell = 10
+            if coarse_cell > 0.0 and pts_world.shape[0] > 0:
+                coarse_coords = np.floor(pts_world / coarse_cell).astype(np.int64)
+                _, inv, counts = np.unique(
+                    coarse_coords, axis=0, return_inverse=True, return_counts=True
+                )
+                dense_mask = counts[inv] >= min_points_per_cell
+                if not np.all(dense_mask):
+                    pts_world = pts_world[dense_mask]
+                    sem_flat = sem_flat[dense_mask]
+                    frame_id_strs = frame_id_strs[dense_mask]
+            if pts_world.shape[0] == 0:
+                continue
+
+            voxel_coords = np.floor(pts_world / voxel_size).astype(np.int64)
+            unique_coords, inverse = np.unique(voxel_coords, axis=0, return_inverse=True)
+            num_vox = unique_coords.shape[0]
+            d = sem_flat.shape[1]
+            feat_sum = np.zeros((num_vox, d), dtype=np.float32)
+            counts = np.zeros((num_vox,), dtype=np.int64)
+            np.add.at(feat_sum, inverse, sem_flat.astype(np.float32))
+            np.add.at(counts, inverse, 1)
+
+            local_contribs = [set() for _ in range(num_vox)]
+            for p_i, v_i in enumerate(inverse.tolist()):
+                local_contribs[v_i].add((int(submap_id), str(frame_id_strs[p_i])))
+
+            for v_i, coord in enumerate(unique_coords):
+                key = (int(coord[0]), int(coord[1]), int(coord[2]))
+                if key not in voxel_sums:
+                    voxel_sums[key] = feat_sum[v_i].copy()
+                    voxel_counts[key] = int(counts[v_i])
+                    voxel_contribs[key] = set()
+                else:
+                    voxel_sums[key] += feat_sum[v_i]
+                    voxel_counts[key] += int(counts[v_i])
+                voxel_contribs[key].update(local_contribs[v_i])
+
+        if len(voxel_sums) == 0:
+            vox = SemanticVoxel(
+                voxel_size=float(voxel_size),
+                centers_world=np.zeros((0, 3), dtype=np.float32),
+                features=np.zeros((0, 0), dtype=np.float32),
+                contributors=[],
+            )
+            return SemanticVoxelMap(vox, frame_name_maps=frame_name_maps)
+
+        coords_list = np.array(list(voxel_sums.keys()), dtype=np.int64)
+        centers_world = ((coords_list.astype(np.float32) + 0.5) * voxel_size).astype(
+            np.float32
+        )
+        features = np.stack(
+            [voxel_sums[k] / max(voxel_counts[k], 1) for k in voxel_sums.keys()], axis=0
+        ).astype(np.float32)
+        contributors = []
+        for k in voxel_sums.keys():
+            contrib_list = sorted(list(voxel_contribs[k])) if deduplicate_contributors else list(
+                voxel_contribs[k]
+            )
+            contributors.append(contrib_list)
+
+        vox = SemanticVoxel(
+            voxel_size=float(voxel_size),
+            centers_world=centers_world,
+            features=features,
+            contributors=contributors,
+        )
+        return SemanticVoxelMap(vox, frame_name_maps=frame_name_maps)
+
     def apply_similarity_transform(self, T_world_from_pred: np.ndarray) -> None:
         """
         Apply a global similarity/affine transform to the entire map by left-multiplying each submap's

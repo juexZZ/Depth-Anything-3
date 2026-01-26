@@ -9,7 +9,7 @@ Model:
   loop_chunk_size: 20 # imgs of loop chunk = 2 * loop_chunk_size
   loop_enable: True
   useDBoW: False
-  delete_temp_files: True
+  delete_temp_files: False
   align_lib: 'triton' # choose among 'triton' (GPU), 'torch' (GPU), 'numba' (CPU) or 'numpy' (CPU)
   align_method: 'sim3' # choose among 'sim3', 'se3' or 'scale+se3'
   scale_compute_method: 'auto' # choose among 'auto', 'ransac' or 'weighted'. It is used when align_method == 'scale+se3'
@@ -51,10 +51,12 @@ Loop:
     lambda_init: 1e-6
 
 Semantic_Voxels:
-  enable: False
+  enable: True
+  only_from_temp: False
   voxel_size: 0.1
+  image_size: [504, 504] # adjust the feature map size to match the image size
   stride: 1
-  feature_dir: '' # default: image_dir
+  feature_dir: '/local_data/jz4725/VGGT-SLAM/samclip/8thfloor_small_5times' # default: image_dir
   feature_key: '' # leave empty to auto-detect
   feature_suffix: '' # e.g. '_feat' if filenames are <stem>_feat.npz
   feature_ext: '.npz'
@@ -64,3 +66,6 @@ Semantic_Voxels:
   use_torch: True
   ignore_loop_closure_frames: False
   deduplicate_contributors: True
+  stream_submaps: True
+  cache_submaps: False
+  submap_cache_dir: '' # default: <output_dir>/submaps

@@ -123,7 +123,32 @@ class SemanticVoxelMap:
         Return the latest frame at a voxel index.
         """
         voxel_contributors = self.voxels.contributors[voxel_index]
-        # rank revers by submap id and then frame id
+        if len(voxel_contributors) == 0:
+            return None
+
+        # Prefer timestamp parsed from resolved frame name if available, else fallback to submap/frame id.
+        best = None  # (timestamp, submap_id, frame_id, name)
+        for submap_id, frame_id in voxel_contributors:
+            name = self.resolve_contributor(submap_id, frame_id)
+            timestamp = None
+            # Expect pattern like "left_1700000000" or "right_1700000000".
+            base = str(name).split("/")[-1]
+            parts = base.split("_")
+            tail = parts[-1].split(".")[0]
+            if tail.isdigit():
+                timestamp = int(tail)
+            if best is None:
+                best = (timestamp, int(submap_id), str(frame_id), name)
+            else:
+                best_ts = best[0]
+                if timestamp is not None and (best_ts is None or timestamp > best_ts):
+                    best = (timestamp, int(submap_id), str(frame_id), name)
+
+        if best is not None and best[0] is not None:
+            _, submap_id, frame_id, name = best
+            return name, submap_id, frame_id
+
+        # Fallback: rank by submap id then frame id.
         voxel_contributors.sort(key=lambda x: (x[0], x[1]), reverse=True)
         submap_id, frame_id = voxel_contributors[0]
         return self.resolve_contributor(submap_id, frame_id), submap_id, frame_id
@@ -142,6 +167,7 @@ class SemanticVoxelMap:
         json_path = os.path.join(directory_path, "frame_names.json")
         voxel_frames_path = os.path.join(directory_path, "voxel_frame_names.json")
         contrib_arr = np.array(self.voxels.contributors, dtype=object)
+        print("saving voxel number: ", self.voxels.centers_world.shape[0])
         np.savez_compressed(
             npz_path,
             voxel_size=np.float32(self.voxel_size),
@@ -308,6 +334,19 @@ class SemanticVoxelMap:
                 point_size=point_size,
                 point_shape="circle",
             )
+            # addiionally add the retrieved voxel points as a cube
+            if query_voxel_indices is not None and len(query_voxel_indices) > 0:
+                for voxel_index in query_voxel_indices:
+                    voxel_coord = self._voxel_coords[voxel_index]
+                    voxel_center = (voxel_coord[0] + 0.5) * self.voxel_size, (voxel_coord[1] + 0.5) * self.voxel_size, (voxel_coord[2] + 0.5) * self.voxel_size
+                    server.scene.add_box(
+                        name=f"{name}/query_voxel_{voxel_index}",
+                        position=voxel_center,
+                        dimensions=(self.voxel_size*5, self.voxel_size*5, self.voxel_size*5),
+                        color=highlight_color,
+                        wireframe=False,
+                        opacity=1.0,
+                    )
         elif render_mode == "cubes":
             # Add one cube per voxel. This can be expensive if there are many voxels.
             dims = (float(self.voxel_size), float(self.voxel_size), float(self.voxel_size))
