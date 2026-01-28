@@ -104,7 +104,7 @@ if __name__ == "__main__":
                     server.scene.add_box(
                         name=f"query_voxel_{i}",
                         position=voxel_center,
-                        dimensions=(voxel_map.voxel_size*5, voxel_map.voxel_size*5, voxel_map.voxel_size*5),
+                        dimensions=(voxel_map.voxel_size*2, voxel_map.voxel_size*2, voxel_map.voxel_size*2),
                         color=(1.0, 0.0, 0.0),
                         wireframe=False,
                         opacity=1.0,

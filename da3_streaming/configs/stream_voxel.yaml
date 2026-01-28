@@ -1,0 +1,22 @@
+# stream build voxel map config
+Semantic_Voxels:
+  enable: True
+  only_from_temp: False
+  voxel_size: 0.05
+  max_voxels: 15000000 # 0 to disable; increases voxel_size if needed
+  image_size: [504, 504] # adjust the feature map size to match the image size
+  stride: 1
+  feature_dir: '/local_data/jz4725/metacam/data_v3/8thfloor_add/semantic_emb' # default: image_dir
+  feature_key: '' # leave empty to auto-detect
+  feature_suffix: '' # e.g. '_feat' if filenames are <stem>_feat.npz
+  feature_ext: '.npz'
+  output_dir: 'semantic_voxels'
+  conf_threshold_coef: 0.75
+  skip_missing_features: True
+  use_torch: True
+  ignore_loop_closure_frames: False
+  deduplicate_contributors: True
+  stream_submaps: True
+  cache_submaps: False
+  submap_cache_dir: '' # default: <output_dir>/submaps
+  pixel_subsample_rate: 0.2

@@ -9,7 +9,7 @@ Model:
   loop_chunk_size: 20 # imgs of loop chunk = 2 * loop_chunk_size
   loop_enable: True
   useDBoW: False
-  delete_temp_files: False
+  delete_temp_files: True
   align_lib: 'triton' # choose among 'triton' (GPU), 'torch' (GPU), 'numba' (CPU) or 'numpy' (CPU)
   align_method: 'sim3' # choose among 'sim3', 'se3' or 'scale+se3'
   scale_compute_method: 'auto' # choose among 'auto', 'ransac' or 'weighted'. It is used when align_method == 'scale+se3'
@@ -20,7 +20,7 @@ Model:
   depth_threshold: 15.0
 
   save_depth_conf_result: True
-  save_debug_info: False
+  save_debug_info: True
 
   Sparse_Align:
     keypoint_select: 'orb' # choose among 'orb', 'fast' or 'disk'
@@ -32,7 +32,7 @@ Model:
     tol: 1e-9
 
   Pointcloud_Save:
-    sample_ratio: 0.015
+    sample_ratio: 0.05
     conf_threshold_coef: 0.75 # conf_threshold = np.mean(confs) * conf_threshold_coef
 
 Loop:
@@ -51,12 +51,13 @@ Loop:
     lambda_init: 1e-6
 
 Semantic_Voxels:
-  enable: True
+  enable: False
   only_from_temp: False
-  voxel_size: 0.1
+  voxel_size: 0.05
+  max_voxels: 15000000 # 0 to disable; increases voxel_size if needed
   image_size: [504, 504] # adjust the feature map size to match the image size
   stride: 1
-  feature_dir: '/local_data/jz4725/VGGT-SLAM/samclip/8thfloor_small_5times' # default: image_dir
+  feature_dir: '/local_data/jz4725/metacam/data_v3/8thfloor_add/semantic_emb' # default: image_dir
   feature_key: '' # leave empty to auto-detect
   feature_suffix: '' # e.g. '_feat' if filenames are <stem>_feat.npz
   feature_ext: '.npz'

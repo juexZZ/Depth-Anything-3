@@ -853,7 +853,7 @@ class DA3_Streaming:
                 # Try common keys, then fallback to the only array if unambiguous.
                 for key in ("feat", "feature", "features", "embedding", "embeddings"):
                     if key in data:
-                        print(f"Using feature key: {key} in {feature_path}")
+                        # print(f"Using feature key: {key} in {feature_path}")
                         feat = data[key]
                         break
                 if feat is None:
@@ -872,6 +872,7 @@ class DA3_Streaming:
             return
 
         voxel_size = float(cfg.get("voxel_size", 0.1))
+        max_voxels = int(cfg.get("max_voxels", 0))
         image_size = cfg.get("image_size", [504, 504])
         stride = int(cfg.get("stride", 1))
         conf_threshold_coef = float(
@@ -896,6 +897,116 @@ class DA3_Streaming:
 
         if not os.path.isdir(feature_dir):
             raise FileNotFoundError(f"Feature directory not found: {feature_dir}")
+
+        def _filtered_points_for_bounds(
+            world_points: np.ndarray, conf: np.ndarray, conf_coef: float, base_voxel: float
+        ) -> Optional[np.ndarray]:
+            if world_points.ndim == 3:
+                world_points = world_points[None, ...]
+            if conf.ndim == 2:
+                conf = conf[None, ...]
+
+            conf_threshold = float(np.mean(conf)) * conf_coef
+            mask = conf >= conf_threshold
+            pts_flat = world_points[mask]
+            if pts_flat.shape[0] == 0:
+                return None
+
+            finite_mask = np.isfinite(pts_flat).all(axis=1)
+            if not np.all(finite_mask):
+                pts_flat = pts_flat[finite_mask]
+            if pts_flat.shape[0] == 0:
+                return None
+
+            lo = np.percentile(pts_flat, 0.5, axis=0)
+            hi = np.percentile(pts_flat, 99.5, axis=0)
+            bbox_mask = (pts_flat >= lo).all(axis=1) & (pts_flat <= hi).all(axis=1)
+            if not np.all(bbox_mask):
+                pts_flat = pts_flat[bbox_mask]
+            if pts_flat.shape[0] == 0:
+                return None
+
+            coarse_cell = float(base_voxel) * 3.0
+            min_points_per_cell = 10
+            if coarse_cell > 0.0 and pts_flat.shape[0] > 0:
+                coarse_coords = np.floor(pts_flat / coarse_cell).astype(np.int64)
+                _, inv, counts_c = np.unique(
+                    coarse_coords, axis=0, return_inverse=True, return_counts=True
+                )
+                dense_mask = counts_c[inv] >= min_points_per_cell
+                if not np.all(dense_mask):
+                    pts_flat = pts_flat[dense_mask]
+            if pts_flat.shape[0] == 0:
+                return None
+
+            return pts_flat
+
+        if max_voxels > 0:
+            bounds_min = None
+            bounds_max = None
+            for chunk_idx, chunk_range in enumerate(self.chunk_indices):
+                aligned_path = os.path.join(
+                    self.result_aligned_dir, f"chunk_{chunk_idx}.npy"
+                )
+                if not os.path.exists(aligned_path):
+                    continue
+
+                chunk_data = np.load(aligned_path, allow_pickle=True).item()
+                if isinstance(chunk_data, dict):
+                    world_points = chunk_data.get("world_points", None)
+                    conf = chunk_data.get("conf", None)
+                else:
+                    depth = chunk_data.depth
+                    intrinsics = chunk_data.intrinsics
+                    extrinsics = chunk_data.extrinsics
+                    if depth.ndim == 2:
+                        depth = depth[None, ...]
+                    if intrinsics.ndim == 2:
+                        intrinsics = intrinsics[None, ...]
+                    if extrinsics.ndim == 2:
+                        extrinsics = extrinsics[None, ...]
+                    world_points = depth_to_point_cloud_vectorized(
+                        depth, intrinsics, extrinsics
+                    )
+                    conf = chunk_data.conf
+
+                if world_points is None or conf is None:
+                    continue
+
+                pts_flat = _filtered_points_for_bounds(
+                    np.asarray(world_points, dtype=np.float32),
+                    np.asarray(conf, dtype=np.float32),
+                    conf_threshold_coef,
+                    voxel_size,
+                )
+                if pts_flat is None or pts_flat.shape[0] == 0:
+                    continue
+
+                lo = np.min(pts_flat, axis=0)
+                hi = np.max(pts_flat, axis=0)
+                if bounds_min is None:
+                    bounds_min = lo
+                    bounds_max = hi
+                else:
+                    bounds_min = np.minimum(bounds_min, lo)
+                    bounds_max = np.maximum(bounds_max, hi)
+
+            if bounds_min is not None and bounds_max is not None:
+                extents = bounds_max - bounds_min
+                extents = np.maximum(extents, 1e-6)
+                volume = float(np.prod(extents))
+                required_size = float((volume / float(max_voxels)) ** (1.0 / 3.0))
+                if required_size > voxel_size:
+                    print(
+                        "[semantic] increasing voxel_size "
+                        f"from {voxel_size:.6f} to {required_size:.6f} "
+                        f"to keep voxels under {max_voxels}"
+                    )
+                    voxel_size = required_size
+                else:
+                    print(f"[semantic] voxel_size {voxel_size:.6f} is already sufficient for {max_voxels} voxels")
+            else:
+                print("[semantic] max_voxels set, but no valid points to estimate bounds")
 
         if stream_submaps:
             frame_name_maps = {}
@@ -1111,7 +1222,7 @@ class DA3_Streaming:
                 frame_paths = self.img_list[chunk_range[0] : chunk_range[1]]
                 for local_idx, (frame_id, image_path) in tqdm(enumerate(
                     zip(range(chunk_range[0], chunk_range[1]), frame_paths)
-                ), desc=f"Loading frame embeddings and accumulating voxel features for chunk {chunk_idx}"):
+                ), desc=f"Loading frame embeddings and accumulating voxel features for chunk {chunk_idx} out of {len(self.chunk_indices)}"):
                     frame_ids.append(int(frame_id))
                     frame_id_to_name[str(frame_id)] = os.path.basename(image_path)
 
@@ -1167,9 +1278,9 @@ class DA3_Streaming:
                     keep_idx = keep_idx[dense_mask]
                 keep_mask_full.reshape(-1)[keep_idx] = True
 
-                for local_idx, (frame_id, image_path) in enumerate(
-                    zip(range(chunk_range[0], chunk_range[1]), frame_paths)
-                ):
+                for local_idx, (frame_id, image_path) in tqdm(
+                    enumerate(zip(range(chunk_range[0], chunk_range[1]), frame_paths)), 
+                    desc=f"Accumulating voxel features for chunk {chunk_idx} out of {len(self.chunk_indices)}"):
                     frame_keep = keep_mask_full[local_idx]
                     if not frame_keep.any():
                         continue
@@ -1227,7 +1338,7 @@ class DA3_Streaming:
                     sorted(list(s)) if deduplicate_contributors else list(s)
                 )
                 contributors.append(contrib_list)
-
+            print(f"[semantic] buildingsemantic voxel map to {output_dir}")
             vox = SemanticVoxel(
                 voxel_size=float(voxel_size),
                 centers_world=centers_world,
@@ -1235,7 +1346,7 @@ class DA3_Streaming:
                 contributors=contributors,
             )
             voxel_map = SemanticVoxelMap(vox, frame_name_maps=frame_name_maps)
-
+            print(f"[semantic] saving semantic voxel map to {output_dir}")
             voxel_map.save_to_directory(output_dir)
             # Also persist inverse mapping frame -> voxel indices for later querying.
             frame_to_voxels_path = os.path.join(output_dir, "frame_to_voxels.json")
@@ -1246,117 +1357,8 @@ class DA3_Streaming:
             print(f"[semantic] saved semantic voxel map to {output_dir}")
             return
 
-        print("No stream submaps, building semantic voxel map...")
-        graph = GraphMap()
-        for chunk_idx, chunk_range in enumerate(self.chunk_indices):
-            aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx}.npy")
-            if not os.path.exists(aligned_path):
-                print(f"[semantic] missing aligned chunk {aligned_path}, skipping")
-                continue
-
-            chunk_data = np.load(aligned_path, allow_pickle=True).item()
-            if isinstance(chunk_data, dict):
-                world_points = chunk_data.get("world_points", None)
-                conf = chunk_data.get("conf", None)
-            else:
-                depth = chunk_data.depth
-                intrinsics = chunk_data.intrinsics
-                extrinsics = chunk_data.extrinsics
-                if depth.ndim == 2:
-                    depth = depth[None, ...]
-                if intrinsics.ndim == 2:
-                    intrinsics = intrinsics[None, ...]
-                if extrinsics.ndim == 2:
-                    extrinsics = extrinsics[None, ...]
-                world_points = depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics)
-                conf = chunk_data.conf
-
-            if world_points is None or conf is None:
-                print(f"[semantic] chunk {chunk_idx} missing world_points/conf, skipping")
-                continue
-            world_points = np.asarray(world_points, dtype=np.float32)
-            print(f"world_points shape: {world_points.shape} for chunk {chunk_idx}")
-            conf = np.asarray(conf, dtype=np.float32)
-            print(f"conf shape: {conf.shape} for chunk {chunk_idx}")
-            if world_points.ndim == 3:
-                world_points = world_points[None, ...]
-            if conf.ndim == 2:
-                conf = conf[None, ...]
-
-            frame_ids = []
-            frame_id_to_name = {}
-            pts_list = []
-            conf_list = []
-            feat_list = []
-
-            frame_paths = self.img_list[chunk_range[0] : chunk_range[1]]
-            for local_idx, (frame_id, image_path) in enumerate(
-                zip(range(chunk_range[0], chunk_range[1]), frame_paths)
-            ):
-                feature_path = self._resolve_feature_path(
-                    image_path, feature_dir, feature_suffix, feature_ext
-                )
-                if not os.path.exists(feature_path):
-                    msg = f"[semantic] missing feature map {feature_path}"
-                    if skip_missing_features:
-                        print(msg + ", skipping frame")
-                        continue
-                    raise FileNotFoundError(msg)
-
-                feat = self._load_feature_map(feature_path, feature_key, image_size)
-                pts = np.asarray(world_points[local_idx], dtype=np.float32)
-                cfs = np.asarray(conf[local_idx], dtype=np.float32)
-
-                if feat.shape[0] != pts.shape[0] or feat.shape[1] != pts.shape[1]:
-                    raise ValueError(
-                        f"Feature map shape {feat.shape[:2]} doesn't match points "
-                        f"shape {pts.shape[:2]} for {image_path}"
-                    )
-
-                frame_ids.append(int(frame_id))
-                frame_id_to_name[str(frame_id)] = os.path.basename(image_path)
-                pts_list.append(pts)
-                conf_list.append(cfs)
-                feat_list.append(feat)
-
-            if len(pts_list) == 0:
-                continue
-
-            pointclouds = np.stack(pts_list, axis=0).astype(np.float32)
-            semantic_embeddings = np.stack(feat_list, axis=0).astype(np.float32)
-            conf_stack = np.stack(conf_list, axis=0).astype(np.float32)
-            conf_threshold = float(np.mean(conf_stack)) * conf_threshold_coef
-            print(f"pointclouds shape: {pointclouds.shape} for chunk {chunk_idx}")
-            print(f"semantic_embeddings shape: {semantic_embeddings.shape} for chunk {chunk_idx}")
-            print(f"conf_stack shape: {conf_stack.shape} for chunk {chunk_idx}")
-            print(f"conf_threshold: {conf_threshold} for chunk {chunk_idx}")
-            print("building submap...")
-            submap = SemanticSubmap(
-                submap_id=chunk_idx,
-                pointclouds=pointclouds,
-                semantic_embeddings=semantic_embeddings,
-                conf=conf_stack,
-                conf_threshold=conf_threshold,
-                frame_ids=np.asarray(frame_ids, dtype=np.int64),
-                frame_id_to_name=frame_id_to_name,
-                H_world_map=np.eye(4, dtype=np.float64),
-            )
-            print("adding submap to graph...")
-            graph.add_submap(submap)
-
-        if graph.get_num_submaps() == 0:
-            print("[semantic] no submaps created, skipping voxelization")
-            return
-
-        voxel_map = graph.build_semantic_voxel_map(
-            voxel_size=voxel_size,
-            stride=stride,
-            ignore_loop_closure_frames=ignore_loop_closure_frames,
-            deduplicate_contributors=deduplicate_contributors,
-            use_torch=use_torch,
-        )
-        voxel_map.save_to_directory(output_dir)
-        print(f"[semantic] saved semantic voxel map to {output_dir}")
+        else:
+            print("[Let's do streaming semantic voxel map]")
 
     def _has_aligned_temp_results(self) -> bool:
         if not os.path.isdir(self.result_aligned_dir):
