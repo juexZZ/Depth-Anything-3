@@ -37,3 +37,8 @@ output/
 outputs/
 output_voxels/
 weights/
+output_pcd/
+metric_depth_results/
+
+# Local experiment inputs, outputs and dependency checkouts
+/test_images/

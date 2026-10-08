@@ -401,6 +401,8 @@ def build_streaming_semantic_voxel_map(
     seed: int = 42,
     max_frames: Optional[int] = None,
     subtract_free_space: bool = True,
+    debug_visualize: bool = False,
+    debug_viser_port: int = 8080,
 ) -> SemanticVoxelMap:
     """
     Sequentially read frames and build a global semantic voxel map.
@@ -422,6 +424,45 @@ def build_streaming_semantic_voxel_map(
     frame_extrinsics: List[Tuple[int, str, np.ndarray]] = []
 
     frame_ids = reader.get_frame_ids()
+
+    debug_global_pcd = None
+    debug_server = None
+    debug_frame_handle = None
+    debug_voxel_handle = None
+    debug_frame_voxel_handle = None
+    if debug_visualize:
+        try:
+            import viser  # local import to keep optional dependency
+        except Exception as exc:
+            raise ImportError(
+                "viser is required for debug visualization. Please install it to use --debug_visualize."
+            ) from exc
+        try:
+            import open3d as o3d  # local import to keep optional dependency
+        except Exception:
+            o3d = None
+        ply_path = os.path.join(reader.scene_res_dir, "pcd/combined_pcd.ply")
+        if o3d is not None and os.path.exists(ply_path):
+            debug_global_pcd = o3d.io.read_point_cloud(ply_path)
+        elif os.path.exists(ply_path):
+            print(f"[debug] open3d not available, skipping global pcd: {ply_path}")
+        else:
+            print(f"[debug] Global point cloud not found: {ply_path}")
+
+        debug_server = viser.ViserServer(host="0.0.0.0", port=debug_viser_port)
+        if debug_global_pcd is not None and not debug_global_pcd.is_empty():
+            global_points = np.asarray(debug_global_pcd.points, dtype=np.float32)
+            if debug_global_pcd.has_colors():
+                global_colors = np.asarray(debug_global_pcd.colors, dtype=np.float32)
+            else:
+                global_colors = np.full((global_points.shape[0], 3), 0.7, dtype=np.float32)
+            debug_server.scene.add_point_cloud(
+                name="global_points",
+                points=global_points,
+                colors=global_colors,
+                point_size=0.01,
+            )
+        print(f"[debug] Viser server running on port {debug_viser_port}")
 
     for frame_id in tqdm(frame_ids, desc="Streaming voxelization"):
         geom = reader.read_frame_geometry(frame_id)
@@ -461,7 +502,7 @@ def build_streaming_semantic_voxel_map(
         mask = np.isfinite(points_world).all(axis=2)
         if conf_threshold_coef is not None:
             conf_thresh = float(np.mean(conf)) * conf_threshold_coef
-            mask = mask & (conf >= conf_thresh)
+            mask = mask & (conf >= conf_thresh) & (conf > 1e-5)
         if not mask.any():
             continue
 
@@ -506,6 +547,64 @@ def build_streaming_semantic_voxel_map(
             if frame_id not in contrib_set_map[key]:
                 contributors_map[key].append((submap_id, str(frame_id)))
                 contrib_set_map[key].add(frame_id)
+
+        if debug_visualize and debug_server is not None:
+            frame_points = pts_flat.astype(np.float32, copy=False)
+            frame_colors = np.full(
+                (frame_points.shape[0], 3), [1.0, 0.2, 0.2], dtype=np.float32
+            )
+            voxel_centers = (
+                (np.asarray(voxel_coords_list, dtype=np.float32) + 0.5) * float(voxel_size)
+            ).astype(np.float32)
+            voxel_colors = np.full(
+                (voxel_centers.shape[0], 3), [0.2, 0.6, 1.0], dtype=np.float32
+            )
+            frame_voxel_centers = (
+                (unique_coords.astype(np.float32, copy=False) + 0.5) * float(voxel_size)
+            ).astype(np.float32)
+            frame_voxel_colors = np.full(
+                (frame_voxel_centers.shape[0], 3), [0.2, 1.0, 0.2], dtype=np.float32
+            )
+
+            if debug_frame_handle is None:
+                debug_frame_handle = debug_server.scene.add_point_cloud(
+                    name="frame_points",
+                    points=frame_points,
+                    colors=frame_colors,
+                    point_size=0.01,
+                )
+            else:
+                debug_frame_handle.points = frame_points
+                debug_frame_handle.colors = frame_colors
+
+            if debug_voxel_handle is None:
+                debug_voxel_handle = debug_server.scene.add_point_cloud(
+                    name="voxel_centers",
+                    points=voxel_centers,
+                    colors=voxel_colors,
+                    point_size=0.02,
+                    point_shape="circle",
+                )
+            else:
+                debug_voxel_handle.points = voxel_centers
+                debug_voxel_handle.colors = voxel_colors
+
+            if debug_frame_voxel_handle is None:
+                debug_frame_voxel_handle = debug_server.scene.add_point_cloud(
+                    name="frame_voxel_centers",
+                    points=frame_voxel_centers,
+                    colors=frame_voxel_colors,
+                    point_size=0.03,
+                    point_shape="square",
+                )
+            else:
+                debug_frame_voxel_handle.points = frame_voxel_centers
+                debug_frame_voxel_handle.colors = frame_voxel_colors
+
+            try:
+                input("Press Enter to continue to the next frame...")
+            except KeyboardInterrupt:
+                break
 
     if len(voxel_coords_list) == 0:
         vox = SemanticVoxel(
@@ -611,6 +710,18 @@ def main() -> None:
         default=False,
         help="Subtract free space from the voxel map",
     )
+    parser.add_argument(
+        "--debug_visualize",
+        action="store_true",
+        default=False,
+        help="Visualize global points, frame points, and voxel centers per frame",
+    )
+    parser.add_argument(
+        "--debug_viser_port",
+        type=int,
+        default=8080,
+        help="Port for the Viser debug server",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -665,6 +776,8 @@ def main() -> None:
         conf_threshold_coef=conf_threshold_coef,
         max_frames=args.max_frames,
         subtract_free_space=subtract_free_space,
+        debug_visualize=args.debug_visualize,
+        debug_viser_port=args.debug_viser_port,
     )
 
 
