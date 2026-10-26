@@ -12,16 +12,18 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Your Name" }]
 
 dependencies = [
+    "addict==2.4.0",
+    "scikit-learn==1.7.2",
     "pre-commit",
     "trimesh",
-    "torch>=2",
-    "torchvision",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
     "einops",
     "huggingface_hub",
     "imageio",
     "numpy<2",
     "opencv-python",
-    "xformers",
+    "xformers==0.0.33.post2",
     "open3d",
     "fastapi",
     "uvicorn",
